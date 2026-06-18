@@ -60,7 +60,7 @@ The goal is simple:
 If you are on an Ubuntu server with OpenEMR already installed:
 
 ```bash
-./install.sh
+bash install.sh
 ```
 
 If you are using Docker, place the compose stack beside this repo and then run the same installer.
