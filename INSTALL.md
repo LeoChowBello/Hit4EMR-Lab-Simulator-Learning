@@ -69,11 +69,28 @@ Use this in the chart:
 1. Open the patient chart.
 2. Open `Encounter`.
 3. Choose `Orders -> Procedure Orders`.
-4. Create a new order.
-5. Pick one of the sample tests.
-6. Save the order.
-7. Wait a few seconds.
-8. Check `Procedures -> Pending Review -> Procedure Results`.
+4. Open the new procedure order form.
+5. In `Default Procedure Type`, choose `Laboratory Test`.
+6. Fill the required order fields:
+   - `Primary Diagnosis`
+   - `Specimen Collection Date`, if the field appears
+   - `Billing Type`, if the field appears
+7. Pick one of the sample tests.
+8. Save the order.
+9. Wait a few seconds.
+10. Check `Procedures -> Pending Review -> Procedure Results`.
+
+## How the form works
+
+The exact OpenEMR screen can vary a little by version, but the lab order flow should still follow the same pattern:
+
+- choose `Laboratory Test`
+- enter a diagnosis
+- complete any required collection or billing fields
+- select the test
+- save the order
+
+If a field is marked as required, students should fill it before clicking save.
 
 ## Why this works better
 
