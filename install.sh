@@ -13,6 +13,25 @@ echo
 MODE="${ONTARIO_LAB_MODE:-}"
 COMPOSE_FILE="${ONTARIO_LAB_COMPOSE:-docker-compose-8.0.x.yml}"
 
+detect_host_style() {
+    if [ -n "${AWS_EXECUTION_ENV:-}" ]; then
+        echo "aws"
+        return
+    fi
+
+    if [ -r /sys/class/dmi/id/product_name ] && grep -qi 'ec2' /sys/class/dmi/id/product_name 2>/dev/null; then
+        echo "aws"
+        return
+    fi
+
+    if [ -r /sys/devices/virtual/dmi/id/product_name ] && grep -qi 'ec2' /sys/devices/virtual/dmi/id/product_name 2>/dev/null; then
+        echo "aws"
+        return
+    fi
+
+    echo "local"
+}
+
 pause_for_student() {
     local prompt="$1"
     echo
@@ -38,18 +57,68 @@ if [ -z "$MODE" ] && { [ -n "${OPENEMR_ROOT:-}" ] || [ -n "${OPENEMR_SITES:-}" ]
 fi
 
 if [ -z "$MODE" ]; then
-    if [ -f "$COMPOSE_FILE" ]; then
-        MODE="docker"
-    else
-        MODE="host"
-    fi
+    MODE="host"
 fi
 
-echo "Step 1 of 4: Checking your setup"
+HOST_STYLE="$(detect_host_style)"
+DEFAULT_CHOICE="2"
+if [ "$HOST_STYLE" = "aws" ]; then
+    DEFAULT_CHOICE="1"
+fi
+
+echo "Step 1 of 5: Choose your setup"
 echo
-echo "  Detected mode: $MODE"
+if [ "$HOST_STYLE" = "aws" ]; then
+    echo "  Detected environment: AWS-style Ubuntu host"
+else
+    echo "  Detected environment: local Ubuntu host"
+fi
+
+echo
+echo "Choose the setup that matches this machine:"
+echo "  1. AWS EC2 Ubuntu host install"
+echo "  2. Local Ubuntu host install like ElCurioso"
+if [ -f "$COMPOSE_FILE" ]; then
+    echo "  3. Docker sandbox on this machine"
+fi
+
+read -r -p "Enter choice [${DEFAULT_CHOICE}]: " SETUP_CHOICE
+SETUP_CHOICE="${SETUP_CHOICE:-$DEFAULT_CHOICE}"
+
+case "$SETUP_CHOICE" in
+    1)
+        MODE="host"
+        HOST_STYLE="aws"
+        ;;
+    2)
+        MODE="host"
+        HOST_STYLE="local"
+        ;;
+    3)
+        if [ -f "$COMPOSE_FILE" ]; then
+            MODE="docker"
+        else
+            echo
+            echo "Docker mode is not available because $COMPOSE_FILE was not found."
+            echo "Choose 1 or 2 instead."
+            exit 1
+        fi
+        ;;
+    *)
+        echo
+        echo "Invalid choice. Please rerun the installer and choose 1, 2, or 3."
+        exit 1
+        ;;
+esac
+
+echo
+echo "  Selected mode: $MODE"
 if [ "$MODE" = "host" ]; then
-    echo "  This will connect to OpenEMR already installed on the server."
+    if [ "$HOST_STYLE" = "aws" ]; then
+        echo "  This will prepare the OpenEMR install on the AWS EC2 host."
+    else
+        echo "  This will prepare the OpenEMR install on the local Ubuntu server."
+    fi
 else
     echo "  This will start the Docker lab stack from $COMPOSE_FILE."
 fi
@@ -67,19 +136,26 @@ PY
 then
     echo
     echo "ERROR: Python module 'pymysql' is missing."
-    echo "Install it once as the server admin, then rerun the installer."
-    echo "For example: python3 -m pip install --user pymysql"
-    exit 1
+    if python3 -m pip install --user pymysql >/dev/null 2>&1; then
+        echo "  Installed pymysql for the current user."
+    else
+        echo "  Automatic install failed."
+        echo "  Install it once as the server admin, then rerun the installer."
+        echo "  For example: python3 -m pip install --user pymysql"
+        exit 1
+    fi
 fi
 
 pause_for_student "Press Enter when you are ready to continue."
 
 if [ "$MODE" = "host" ]; then
     echo
-    echo "Step 2 of 4: Preparing your existing OpenEMR install"
+    echo "Step 2 of 5: Preparing your existing OpenEMR install"
     echo
     python3 ontario_lab_turnkey.py --install
 
+    echo
+    echo "Step 3 of 5: Starting the background simulator"
     SIM_LOG="./hit4emr-simulator.log"
     if pgrep -f "ontario_lab_turnkey.py" >/dev/null 2>&1; then
         echo
@@ -118,7 +194,7 @@ else
     fi
 
     echo
-    echo "Step 2 of 4: Starting the Docker lab"
+    echo "Step 2 of 5: Starting the Docker lab"
     echo "   - OpenEMR database"
     echo "   - OpenEMR web application"
     echo "   - Lab simulator"
@@ -155,7 +231,7 @@ else
     printf '\r   Building and starting services complete.      \n'
 
     echo
-    echo "Step 3 of 4: Waiting for OpenEMR to become healthy..."
+    echo "Step 3 of 5: Waiting for OpenEMR to become healthy..."
     echo "   This can take a few minutes."
     echo
     status="starting"
@@ -178,10 +254,12 @@ else
     fi
 
     echo
-    echo "Step 4 of 4: Configuring the student lab"
+    echo "Step 4 of 5: Configuring the student lab"
     echo
     python3 ontario_lab_turnkey.py --install
 
+    echo
+    echo "Step 5 of 5: Starting the background simulator"
     SIM_LOG="./hit4emr-simulator.log"
     if pgrep -f "ontario_lab_turnkey.py" >/dev/null 2>&1; then
         echo
@@ -233,5 +311,13 @@ echo "  6. Check Procedures -> Pending Review -> Procedure Results"
 echo
 echo "Simulator log:"
 echo "  hit4emr-simulator.log"
+echo
+if [ "$MODE" = "host" ] && [ "$HOST_STYLE" = "aws" ]; then
+    echo "AWS note:"
+    echo "  Use the EC2 public IP or public DNS name to reach OpenEMR."
+elif [ "$MODE" = "host" ]; then
+    echo "Local Ubuntu note:"
+    echo "  Use the local network address for ElCurioso to reach OpenEMR."
+fi
 echo
 echo "For more help, see: INSTALL.md"
