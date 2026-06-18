@@ -1,53 +1,38 @@
 #!/usr/bin/env python3
 """
-Hit4EMR Lab Turnkey: version-universal mocklab
+Hit4EMR lab simulator.
 
-The script discovers the OpenEMR Docker layout from docker-compose, inserts the
-Ontario Reference Lab rows, patches the procedure-order validation, and then
-runs the lightweight Flask watcher that turns outgoing orders into inbound
-results.
+This script prepares a student-friendly OpenEMR environment, seeds the sample
+lab catalog, and watches the outgoing EDI folder so results can come back into
+OpenEMR automatically.
 """
 
+from __future__ import annotations
+
+import argparse
 import os
 import random
 import re
-import subprocess
+import shutil
 import sys
-import threading
 import time
 from datetime import datetime
-
-import pymysql
-from flask import Flask
-
-from config_discovery import discover_config
+from pathlib import Path
 
 try:
-    DISCOVERED = discover_config()
-except Exception as exc:
-    print(f"Configuration discovery failed: {exc}")
-    print("Run this from the same directory as docker-compose*.yml")
-    sys.exit(1)
+    import pymysql
+except ImportError:  # pragma: no cover
+    pymysql = None
 
-CONFIG = {
-    "LAB_NAME": "Ontario Reference Lab",
-    "PORT": 5001,
-    "CONTAINER_NAME": DISCOVERED["CONTAINER_NAME"],
-    "MYSQL_CONTAINER": DISCOVERED["MYSQL_CONTAINER"],
-    "MYSQL_SERVICE": DISCOVERED["MYSQL_SERVICE"],
-    "EDI_BASE": DISCOVERED["EDI_BASE"],
-    "DB_CONFIG": DISCOVERED["DB_CONFIG"],
-}
-
+LAB_NAME = "Ontario Reference Lab"
 CATALOG = {
     "6690-2": dict(name="WBC", unit="x10^9/L", low=4.0, high=11.0),
     "718-7": dict(name="Hemoglobin", unit="g/L", low=120.0, high=175.0),
     "1558-6": dict(name="Glucose (Fasting)", unit="mmol/L", low=3.6, high=6.0),
-    "3016-3": dict(name="TSH", unit="mIU/L", low=0.32, high=4.00),
+    "3016-3": dict(name="TSH", unit="mIU/L", low=0.32, high=4.0),
     "2093-3": dict(name="Total Cholesterol", unit="mmol/L", low=0.0, high=5.2),
     "4548-4": dict(name="Hemoglobin A1c", unit="%", low=4.0, high=6.0),
 }
-
 DIAGNOSIS_CATALOG = [
     ("R79.89", "Other specified abnormal findings of blood chemistry"),
     ("D64.9", "Anemia, unspecified"),
@@ -60,7 +45,6 @@ DIAGNOSIS_CATALOG = [
     ("Z13.1", "Encounter for screening for diabetes mellitus"),
     ("Z13.220", "Encounter for screening for lipoid disorders"),
 ]
-
 PROBLEM_DIAGNOSIS_RULES = [
     (("microalbuminuria due to type 2 diabetes mellitus", "proteinuria due to type 2 diabetes mellitus"), "E11.29"),
     (("disorder of kidney due to diabetes mellitus",), "E11.21"),
@@ -89,98 +73,168 @@ PROBLEM_DIAGNOSIS_RULES = [
     (("smoking history",), "Z87.891"),
     (("sports clearance",), "Z02.5"),
 ]
+COMMON_ROOTS = [
+    Path("/var/www/localhost/htdocs/openemr"),
+    Path("/var/www/html/openemr"),
+    Path("/var/www/openemr"),
+    Path("/opt/openemr"),
+    Path("/srv/openemr"),
+]
+COMPOSE_NAMES = (
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "docker-compose-8.0.x.yml",
+)
 
 
-def _read_sqlconf_text():
-    db_config = CONFIG["DB_CONFIG"]
-    if os.path.exists(db_config):
-        with open(db_config, "r", encoding="utf-8") as handle:
-            return handle.read()
+def log(message):
+    print(message, flush=True)
 
-    result = subprocess.run(
-        f"docker exec {CONFIG['CONTAINER_NAME']} cat {db_config}",
-        shell=True,
-        capture_output=True,
-        text=True,
-        timeout=10,
+
+def read_text(path):
+    return Path(path).read_text(encoding="utf-8", errors="ignore")
+
+
+def write_text(path, content):
+    Path(path).write_text(content, encoding="utf-8")
+
+
+def discover_layout():
+    raw_mode = os.getenv("ONTARIO_LAB_MODE", "").strip().lower()
+    sqlconf_env = os.getenv("OPENEMR_SQLCONF", "").strip()
+    sites_env = os.getenv("OPENEMR_SITES", "").strip()
+    root_env = os.getenv("OPENEMR_ROOT", "").strip()
+    compose_file = find_compose_file()
+
+    if sqlconf_env:
+        sqlconf = Path(sqlconf_env).expanduser().resolve()
+        if sqlconf.exists():
+            return derive_layout(raw_mode or "host", sqlconf.parent.parent.parent, sqlconf.parent.parent, sqlconf, compose_file)
+
+    if sites_env:
+        sites = Path(sites_env).expanduser().resolve()
+        sqlconf = sites / "default" / "sqlconf.php"
+        if sqlconf.exists():
+            return derive_layout(raw_mode or "host", sites.parent, sites, sqlconf, compose_file)
+
+    if root_env:
+        root = Path(root_env).expanduser().resolve()
+        sqlconf = root / "sites" / "default" / "sqlconf.php"
+        if sqlconf.exists():
+            return derive_layout(raw_mode or "host", root, root / "sites", sqlconf, compose_file)
+
+    for root in COMMON_ROOTS:
+        sqlconf = root / "sites" / "default" / "sqlconf.php"
+        if sqlconf.exists():
+            return derive_layout(raw_mode or "host", root, root / "sites", sqlconf, compose_file)
+
+    if raw_mode == "docker" and compose_file:
+        return parse_compose_for_sites(compose_file)
+
+    raise FileNotFoundError(
+        "Could not find an OpenEMR install. Set OPENEMR_ROOT, OPENEMR_SITES, or OPENEMR_SQLCONF."
     )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "could not read sqlconf.php")
-    return result.stdout
 
 
-def _parse_sqlconf(text):
-    def grab(key):
-        match = re.search(
-            rf"\${key}\s*=\s*['\"]([^'\"]*)['\"]",
-            text,
-        )
-        if not match:
-            raise ValueError(f"missing ${key} in sqlconf.php")
-        return match.group(1)
+def find_compose_file():
+    cwd = Path.cwd()
+    for name in COMPOSE_NAMES:
+        candidate = cwd / name
+        if candidate.exists():
+            return candidate
+    for pattern in ("docker-compose*.yml", "docker-compose*.yaml"):
+        matches = sorted(cwd.glob(pattern))
+        if matches:
+            return matches[0]
+    return None
 
+
+def derive_layout(mode, root, sites, sqlconf, compose_file=None):
+    root = Path(root).expanduser().resolve()
+    sites = Path(sites).expanduser().resolve()
+    sqlconf = Path(sqlconf).expanduser().resolve()
     return {
-        "user": grab("login"),
-        "password": grab("pass"),
-        "database": grab("dbase"),
+        "mode": mode,
+        "compose_file": str(compose_file) if compose_file else "",
+        "openemr_root": str(root),
+        "sites_root": str(sites),
+        "sqlconf_path": str(sqlconf),
+        "edi_base": str(sites / "default" / "documents" / "edi"),
+        "common_php": str(root / "interface" / "forms" / "procedure_order" / "common.php"),
     }
 
 
-def _mysql_hosts():
-    hosts = []
-    if os.path.exists("/var/www/localhost/htdocs/openemr/sites/default/sqlconf.php"):
-        hosts.extend([CONFIG["MYSQL_SERVICE"], CONFIG["MYSQL_CONTAINER"], "127.0.0.1", "localhost"])
+def parse_compose_for_sites(compose_file):
+    text = Path(compose_file).read_text(encoding="utf-8", errors="ignore")
+    for line in text.splitlines():
+        match = re.match(r"^\s*-\s*[^:]+:(/[^#\s]+)", line)
+        if not match:
+            continue
+        mount_path = match.group(1).rstrip("/")
+        if mount_path.endswith("/sites") or "/openemr/sites" in mount_path:
+            return derive_layout("docker", Path(mount_path).parent.parent, Path(mount_path), Path(mount_path) / "default" / "sqlconf.php", compose_file)
+    raise RuntimeError(
+        f"Could not find an OpenEMR sites mount in {compose_file}. Expected a mount ending in /sites."
+    )
+
+
+def parse_sqlconf(sqlconf_path):
+    text = read_text(sqlconf_path)
+
+    def pick(name, default=""):
+        pattern = rf"\${name}\s*=\s*['\"]([^'\"]*)['\"]"
+        match = re.search(pattern, text)
+        return match.group(1) if match else default
+
+    return {
+        "host": pick("host", "127.0.0.1"),
+        "login": pick("login", ""),
+        "pass": pick("pass", ""),
+        "dbase": pick("dbase", ""),
+        "socket": pick("socket", ""),
+        "port": pick("port", "3306"),
+    }
+
+
+def connect_db(layout):
+    if pymysql is None:
+        raise RuntimeError("PyMySQL is required. Install it with: pip install pymysql")
+
+    config = parse_sqlconf(layout["sqlconf_path"])
+    params = {
+        "user": config["login"],
+        "password": config["pass"],
+        "database": config["dbase"],
+        "charset": "utf8mb4",
+        "autocommit": False,
+    }
+
+    socket_path = config.get("socket", "")
+    if socket_path and Path(socket_path).exists():
+        params["unix_socket"] = socket_path
     else:
-        ip = subprocess.run(
-            f"docker inspect -f '{{{{range.NetworkSettings.Networks}}}}{{{{.IPAddress}}}}{{{{end}}}}' {CONFIG['MYSQL_CONTAINER']}",
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        ).stdout.strip()
-        if ip:
-            hosts.append(ip)
-        hosts.extend([CONFIG["MYSQL_SERVICE"], CONFIG["MYSQL_CONTAINER"], "127.0.0.1", "localhost"])
-
-    seen = set()
-    ordered = []
-    for host in hosts:
-        if host and host not in seen:
-            ordered.append(host)
-            seen.add(host)
-    return ordered
-
-
-def get_db():
-    sqlconf = _parse_sqlconf(_read_sqlconf_text())
-    last_error = None
-
-    for host in _mysql_hosts():
+        params["host"] = config["host"] or "127.0.0.1"
         try:
-            conn = pymysql.connect(
-                host=host,
-                user=sqlconf["user"],
-                password=sqlconf["password"],
-                database=sqlconf["database"],
-                connect_timeout=5,
-                read_timeout=10,
-                write_timeout=10,
-            )
-            print(f"  ✓ Connected to database via {host}")
-            return conn
-        except Exception as exc:
-            last_error = exc
+            params["port"] = int(config.get("port") or 3306)
+        except ValueError:
+            params["port"] = 3306
 
-    raise RuntimeError(f"Could not connect to MySQL: {last_error}")
+    return pymysql.connect(**params)
 
 
-def auto_configure():
-    print("Configuring OpenEMR database...")
-    conn = get_db()
+def ensure_edi_paths(layout):
+    base = Path(layout["edi_base"])
+    for path in (base / "orders", base / "inbox"):
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def seed_procedure_catalog(layout):
+    log("Configuring OpenEMR procedure catalog...")
+    conn = connect_db(layout)
     cur = conn.cursor()
     try:
-        orders_path = f"{CONFIG['EDI_BASE']}/orders"
-        results_path = f"{CONFIG['EDI_BASE']}/inbox"
+        orders_path = f"{layout['edi_base']}/orders"
+        results_path = f"{layout['edi_base']}/inbox"
 
         cur.execute(
             """
@@ -188,16 +242,13 @@ def auto_configure():
               (name, npi, active, direction, protocol, orders_path, results_path)
             VALUES (%s, %s, 1, %s, %s, %s, %s)
             """,
-            (CONFIG["LAB_NAME"], "123456", "B", "FS", orders_path, results_path),
+            (LAB_NAME, "123456", "B", "FS", orders_path, results_path),
         )
 
-        cur.execute(
-            "SELECT ppid FROM procedure_providers WHERE name=%s",
-            (CONFIG["LAB_NAME"],),
-        )
+        cur.execute("SELECT ppid FROM procedure_providers WHERE name=%s LIMIT 1", (LAB_NAME,))
         row = cur.fetchone()
         if not row:
-            raise RuntimeError("procedure provider insert failed")
+            raise RuntimeError("Lab provider row was not created")
         lab_id = row[0]
 
         cur.execute("DELETE FROM procedure_type WHERE lab_id=%s", (lab_id,))
@@ -231,91 +282,51 @@ def auto_configure():
             )
 
         conn.commit()
-
-        cur.execute(
-            "SELECT COUNT(*) FROM procedure_providers WHERE name=%s",
-            (CONFIG["LAB_NAME"],),
-        )
-        provider_count = cur.fetchone()[0]
-        cur.execute(
-            "SELECT COUNT(*) FROM procedure_type WHERE lab_id=%s AND procedure_type='ord'",
-            (lab_id,),
-        )
+        cur.execute("SELECT COUNT(*) FROM procedure_type WHERE lab_id=%s AND procedure_type='ord'", (lab_id,))
         test_count = cur.fetchone()[0]
-
-        print(f"  ✓ Database configured: {provider_count} provider(s), {test_count} test(s)")
-        if provider_count < 1 or test_count < len(CATALOG):
-            raise RuntimeError(
-                f"Lab verification failed: providers={provider_count}, tests={test_count}, expected_tests={len(CATALOG)}"
-            )
-    except Exception as exc:
+        log(f"  ✓ Seeded {test_count} sample lab tests")
+    except Exception:
         conn.rollback()
-        print(f"ERROR during database configuration: {exc}")
         raise
     finally:
         cur.close()
         conn.close()
 
 
-def ensure_edi_paths():
-    print("Ensuring EDI folders are writable...")
-    base = CONFIG["EDI_BASE"]
-    targets = [f"{base}/orders", f"{base}/inbox"]
-
-    if os.path.exists("/var/www/localhost/htdocs/openemr/sites/default/sqlconf.php"):
-        for path in targets:
-            os.makedirs(path, exist_ok=True)
-        subprocess.run(["chown", "-R", "apache:apache", base], check=False)
-        subprocess.run(["chmod", "-R", "ug+rwX", base], check=False)
-    else:
-        for path in targets:
-            subprocess.run(f"docker exec {CONFIG['CONTAINER_NAME']} mkdir -p {path}", shell=True, check=False)
-        subprocess.run(
-            f"docker exec {CONFIG['CONTAINER_NAME']} chown -R apache:apache {base}",
-            shell=True,
-            check=False,
-        )
-        subprocess.run(
-            f"docker exec {CONFIG['CONTAINER_NAME']} chmod -R ug+rwX {base}",
-            shell=True,
-            check=False,
-        )
-
-
-def seed_diagnosis_codes():
-    print("Seeding diagnosis codes...")
-    conn = get_db()
+def seed_diagnosis_codes(layout):
+    log("Seeding diagnosis codes...")
+    conn = connect_db(layout)
     cur = conn.cursor()
     try:
         codes = [code for code, _ in DIAGNOSIS_CATALOG]
-        placeholders = ",".join(["%s"] * len(codes))
-        cur.execute(
-            f"DELETE FROM icd10_dx_order_code WHERE dx_code IN ({placeholders}) OR formatted_dx_code IN ({placeholders})",
-            codes + codes,
-        )
-        cur.executemany(
-            """
-            INSERT INTO icd10_dx_order_code
-              (dx_code, formatted_dx_code, valid_for_coding, short_desc, long_desc, active, revision)
-            VALUES (%s, %s, '1', %s, %s, 1, 0)
-            """,
-            [(code, code, desc[:60], desc) for code, desc in DIAGNOSIS_CATALOG],
-        )
+        if codes:
+            placeholders = ",".join(["%s"] * len(codes))
+            cur.execute(
+                f"DELETE FROM icd10_dx_order_code WHERE dx_code IN ({placeholders}) OR formatted_dx_code IN ({placeholders})",
+                codes + codes,
+            )
+            cur.executemany(
+                """
+                INSERT INTO icd10_dx_order_code
+                  (dx_code, formatted_dx_code, valid_for_coding, short_desc, long_desc, active, revision)
+                VALUES (%s, %s, '1', %s, %s, 1, 0)
+                """,
+                [(code, code, desc[:60], desc) for code, desc in DIAGNOSIS_CATALOG],
+            )
         conn.commit()
         cur.execute("SELECT COUNT(*) FROM icd10_dx_order_code WHERE active=1 AND valid_for_coding='1'")
-        print(f"  ✓ Diagnosis code rows available: {cur.fetchone()[0]}")
-    except Exception as exc:
+        log(f"  ✓ Diagnosis rows available: {cur.fetchone()[0]}")
+    except Exception:
         conn.rollback()
-        print(f"ERROR during diagnosis code seeding: {exc}")
         raise
     finally:
         cur.close()
         conn.close()
 
 
-def seed_problem_history():
-    print("Seeding patient problem history...")
-    conn = get_db()
+def seed_problem_history(layout):
+    log("Backfilling chart diagnosis history...")
+    conn = connect_db(layout)
     cur = conn.cursor()
     try:
         cur.execute(
@@ -332,65 +343,140 @@ def seed_problem_history():
                 if any(needle in title_l for needle in needles):
                     code = mapped
                     break
-            cur.execute(
-                "UPDATE lists SET diagnosis=%s WHERE id=%s",
-                (f"ICD10:{code}", row_id),
-            )
+            cur.execute("UPDATE lists SET diagnosis=%s WHERE id=%s", (f"ICD10:{code}", row_id))
             updated += 1
         conn.commit()
-        print(f"  ✓ Problem history rows updated: {updated}")
-    except Exception as exc:
+        log(f"  ✓ Problem history rows updated: {updated}")
+    except Exception:
         conn.rollback()
-        print(f"ERROR during problem history seeding: {exc}")
         raise
     finally:
         cur.close()
         conn.close()
 
 
-def patch_php():
-    container = CONFIG["CONTAINER_NAME"]
-    target = "/var/www/localhost/htdocs/openemr/interface/forms/procedure_order/common.php"
-    backup = target + ".bak"
-
-    print("Patching OpenEMR validation logic...")
-    subprocess.run(f"docker exec {container} cp {target} {backup}", shell=True, check=False)
-
-    patch_script = """<?php
-$f = '/var/www/localhost/htdocs/openemr/interface/forms/procedure_order/common.php';
-$c = file_get_contents($f);
-$c = str_replace("if ($_POST['form_provider_id'] + 0 < 1)", "if (false && $_POST['form_provider_id'] + 0 < 1)", $c);
-$c = str_replace('if ($_POST["form_provider_id"] + 0 < 1)', 'if (false && $_POST["form_provider_id"] + 0 < 1)', $c);
-$c = str_replace('if ($diag_flag === 0)', 'if (false && $diag_flag === 0)', $c);
-$c = str_replace("if (!$_POST['form_date_collected'] && !$_POST['form_order_psc'])", "if (false && !$_POST['form_date_collected'] && !$_POST['form_order_psc'])", $c);
-$c = str_replace('if (!$_POST["form_date_collected"] && !$_POST["form_order_psc"])', 'if (false && !$_POST["form_date_collected"] && !$_POST["form_order_psc"])', $c);
-$c = str_replace("if (empty($_POST['form_billing_type']))", "if (false && empty($_POST['form_billing_type']))", $c);
-$c = str_replace('if (empty($_POST["form_billing_type"]))', 'if (false && empty($_POST["form_billing_type"]))', $c);
-file_put_contents($f, $c);
-?>"""
-
-    patch_path = os.path.join("/tmp", "ontario_lab_patch.php")
-    with open(patch_path, "w", encoding="utf-8") as handle:
-        handle.write(patch_script)
-
-    subprocess.run(f"docker exec -i {container} php < {patch_path}", shell=True, check=False)
-    check = subprocess.run(
-        f"docker exec {container} php -l {target}",
-        shell=True,
-        capture_output=True,
-        text=True,
-    )
-    if "No syntax errors detected" not in check.stdout:
-        subprocess.run(f"docker exec {container} cp {backup} {target}", shell=True, check=False)
-        raise RuntimeError("PHP patch failed and was rolled back")
-
-
-def publish_openemr_results(order_id, control_id, result_rows):
-    print("Publishing results into OpenEMR Procedure Results...")
-    if not result_rows:
+def patch_order_form(layout):
+    path = Path(layout["common_php"])
+    if not path.exists():
+        log(f"Skipping order-form patch; file not found: {path}")
         return
 
-    conn = get_db()
+    try:
+        original = read_text(path)
+        updated = original
+        replacements = [
+            (
+                r"if\s*\(\s*\$_POST\[(?:\"|')form_provider_id(?:\"|')\]\s*\+\s*0\s*<\s*1\s*\)",
+                'if (false && $_POST["form_provider_id"] + 0 < 1)',
+            ),
+            (r"if\s*\(\s*\$diag_flag\s*===\s*0\s*\)", "if (false && $diag_flag === 0)"),
+            (
+                r"if\s*\(\s*!\$_POST\[(?:\"|')form_date_collected(?:\"|')\]\s*&&\s*!\$_POST\[(?:\"|')form_order_psc(?:\"|')\]\s*\)",
+                'if (false && !$_POST["form_date_collected"] && !$_POST["form_order_psc"])',
+            ),
+            (
+                r"if\s*\(\s*empty\(\$_POST\[(?:\"|')form_billing_type(?:\"|')\]\)\s*\)",
+                'if (false && empty($_POST["form_billing_type"]))',
+            ),
+        ]
+        for pattern, replacement in replacements:
+            updated = re.sub(pattern, replacement, updated)
+
+        if updated == original:
+            log("Order-form patch not needed on this OpenEMR version.")
+            return
+
+        backup = path.with_suffix(path.suffix + ".ontario-lab.bak")
+        if not backup.exists():
+            shutil.copy2(path, backup)
+        write_text(path, updated)
+        log(f"  ✓ Patched order-form validation: {path}")
+    except PermissionError:
+        log("  ! Could not patch the order form because of file permissions. Continuing.")
+    except Exception as exc:
+        log(f"  ! Order-form patch skipped: {exc}")
+
+
+def parse_order_message(content):
+    patient = {"fname": "Patient", "lname": "Unknown"}
+    tests = []
+
+    for line in content.splitlines():
+        if line.startswith("PID|"):
+            parts = line.split("|")
+            if len(parts) > 5:
+                name_bits = parts[5].split("^")
+                if name_bits and name_bits[0]:
+                    patient["lname"] = name_bits[0]
+                if len(name_bits) > 1 and name_bits[1]:
+                    patient["fname"] = name_bits[1]
+        elif line.startswith("OBR|"):
+            match = re.search(r"\|\|([^\|\^]+)\^", line)
+            if match:
+                tests.append(match.group(1))
+
+    return patient, tests
+
+
+def build_result_message(order_text):
+    patient, tests = parse_order_message(order_text)
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    control_id = f"ONT{timestamp}"
+
+    lines = [
+        f"MSH|^~\\&|ONTARIOLAB|LAB|OPENEMR|CLINIC|{timestamp}||ORU^R01|{control_id}|D|2.3",
+        f"PID|1||1||{patient['lname']}^{patient['fname']}||19800101|M",
+    ]
+
+    result_rows = []
+    for sequence, code in enumerate(tests, start=1):
+        meta = CATALOG.get(code, {"name": "Test", "unit": "units", "low": 0.0, "high": 100.0})
+        value = round(random.uniform(meta["low"], meta["high"]), 1)
+        result_rows.append(
+            {
+                "sequence": sequence,
+                "code": code,
+                "name": meta["name"],
+                "unit": meta["unit"],
+                "value": value,
+                "range": f"{meta['low']}-{meta['high']}",
+                "abnormal": "N",
+            }
+        )
+        lines.append(f"OBR|{sequence}|{control_id}||{code}^{meta['name']}^LN|||{timestamp}|||||||||||F")
+        lines.append(
+            f"OBX|1|NM|{code}^{meta['name']}^LN||{value}|{meta['unit']}|{meta['low']}-{meta['high']}|N|||F"
+        )
+
+    return "\n".join(lines) + "\n", result_rows, control_id
+
+
+def find_latest_order_id(conn, patient_fname, patient_lname):
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT id FROM patient_data WHERE fname=%s AND lname=%s LIMIT 1",
+            (patient_fname, patient_lname),
+        )
+        patient = cur.fetchone()
+        if not patient:
+            return None
+
+        patient_id = patient[0]
+        cur.execute(
+            "SELECT procedure_order_id FROM procedure_order WHERE patient_id=%s ORDER BY procedure_order_id DESC LIMIT 1",
+            (patient_id,),
+        )
+        order_row = cur.fetchone()
+        return order_row[0] if order_row else None
+    finally:
+        cur.close()
+
+
+def publish_openemr_results(conn, order_id, control_id, result_rows):
+    if not result_rows:
+        return 0
+
     cur = conn.cursor()
     inserted = 0
     try:
@@ -446,7 +532,7 @@ def publish_openemr_results(order_id, control_id, result_rows):
                     report_id,
                     item["code"],
                     item["name"],
-                    CONFIG["LAB_NAME"],
+                    LAB_NAME,
                     item["unit"],
                     item["value"],
                     item["range"],
@@ -456,151 +542,89 @@ def publish_openemr_results(order_id, control_id, result_rows):
             inserted += 1
 
         conn.commit()
-        print(f"  ✓ Procedure Results rows inserted: {inserted}")
-    except Exception as exc:
+        return inserted
+    except Exception:
         conn.rollback()
-        print(f"ERROR during OpenEMR result publication: {exc}")
         raise
     finally:
         cur.close()
-        conn.close()
 
 
-def process_logic():
-    orders_dir = f"{CONFIG['EDI_BASE']}/orders"
-    inbox_dir = f"{CONFIG['EDI_BASE']}/inbox"
-
-    try:
-        if os.path.exists(orders_dir):
-            files = [name for name in os.listdir(orders_dir) if name.endswith(".txt")]
-        else:
-            result = subprocess.run(
-                f"docker exec {CONFIG['CONTAINER_NAME']} ls {orders_dir} 2>/dev/null || true",
-                shell=True,
-                capture_output=True,
-                text=True,
-            )
-            files = [name for name in result.stdout.splitlines() if name.endswith(".txt")]
-    except Exception:
+def process_order_files(layout):
+    orders_dir = Path(layout["edi_base"]) / "orders"
+    inbox_dir = Path(layout["edi_base"]) / "inbox"
+    if not orders_dir.exists():
         return
 
-    for fname in files:
-        order_path = os.path.join(orders_dir, fname)
+    for order_path in sorted(orders_dir.glob("*.txt")):
+        conn = None
         try:
-            result_rows = []
-            if os.path.exists(order_path):
-                with open(order_path, "r", encoding="utf-8") as handle:
-                    raw = handle.read()
-            else:
-                result = subprocess.run(
-                    f"docker exec {CONFIG['CONTAINER_NAME']} cat {order_path}",
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                )
-                if result.returncode != 0:
-                    continue
-                raw = result.stdout
+            order_text = read_text(order_path)
+            result_text, result_rows, control_id = build_result_message(order_text)
+            patient, _ = parse_order_message(order_text)
 
-            lines = raw.splitlines()
-            msh = lines[0].split("|") if lines else []
-            control_id = msh[9] if len(msh) > 9 else "SIM"
+            conn = connect_db(layout)
             try:
-                order_id = int(control_id)
-            except Exception:
-                order_id = int(os.path.splitext(fname)[0])
-            pid = next((line for line in lines if line.startswith("PID|")), "PID|1||||Unk^Pat||19800101|M")
-            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+                order_id = find_latest_order_id(conn, patient["fname"], patient["lname"])
+                if not order_id:
+                    log(f"  ! Waiting for OpenEMR order record for {order_path.name}")
+                    continue
 
-            response = f"MSH|^~\\&|ONTARIOLAB|LAB|OPENEMR|CLINIC|{timestamp}||ORU^R01|{control_id}|D|2.3\n{pid}\n"
-            for sequence, code in re.findall(r"OBR\|(\d+)\|.*?\|\|(.*?)\^", raw):
-                response += f"OBR|{sequence}|{control_id}||{code}^|||{timestamp}|||||||||||F\n"
-                meta = CATALOG.get(code, {"name": "Test", "unit": "units", "low": 0, "high": 100})
-                value = round(random.uniform(meta["low"], meta["high"]), 1)
-                result_rows.append(
-                    {
-                        "sequence": int(sequence),
-                        "code": code,
-                        "name": meta["name"],
-                        "unit": meta["unit"],
-                        "value": value,
-                        "range": f'{meta["low"]}-{meta["high"]}',
-                        "abnormal": "N",
-                    }
-                )
-                response += (
-                    f'OBX|1|NM|{code}^{meta["name"]}^LN||{value}|{meta["unit"]}|'
-                    f'{meta["low"]}-{meta["high"]}|N|||F\n'
-                )
+                result_path = inbox_dir / f"RES_{order_path.name}"
+                write_text(result_path, result_text)
+                inserted = publish_openemr_results(conn, order_id, control_id, result_rows)
 
-            result_path = os.path.join(inbox_dir, f"RES_{fname}")
-            if os.path.exists(inbox_dir):
-                with open(result_path, "w", encoding="utf-8") as handle:
-                    handle.write(response)
-            else:
-                subprocess.run(
-                    f"docker exec {CONFIG['CONTAINER_NAME']} bash -lc 'cat > {result_path}'",
-                    input=response,
-                    text=True,
-                    shell=True,
-                    check=False,
-                )
-
-            publish_openemr_results(order_id, control_id, result_rows)
-            if os.path.exists(result_path):
-                os.remove(result_path)
-
-            if os.path.exists(order_path):
-                os.remove(order_path)
-            else:
-                subprocess.run(f"docker exec {CONFIG['CONTAINER_NAME']} rm {order_path}", shell=True, check=False)
-        except Exception:
-            pass
+                if inserted:
+                    order_path.unlink(missing_ok=True)
+                    result_path.unlink(missing_ok=True)
+                    log(f"  ✓ Processed {order_path.name} and inserted {inserted} result row(s)")
+            finally:
+                if conn and conn.open:
+                    conn.close()
+        except Exception as exc:
+            log(f"  ! Could not process {order_path.name}: {exc}")
 
 
-def watcher():
+def run_loop(layout):
+    log("Starting Hit4EMR lab simulator...")
+    log(f"  OpenEMR root: {layout['openemr_root']}")
+    log(f"  EDI base: {layout['edi_base']}")
+    log("")
+
     while True:
-        process_logic()
+        try:
+            process_order_files(layout)
+        except Exception as exc:
+            log(f"Simulator loop warning: {exc}")
         time.sleep(5)
 
 
-app = Flask(__name__)
+def install(layout):
+    ensure_edi_paths(layout)
+    seed_procedure_catalog(layout)
+    seed_diagnosis_codes(layout)
+    seed_problem_history(layout)
+    patch_order_form(layout)
+    log("Installation complete.")
 
 
-@app.route("/")
-def home():
-    return "<h1>Ontario Lab Active ✅</h1>"
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Hit4EMR Lab Simulator")
+    parser.add_argument("--install", action="store_true", help="Prepare OpenEMR for the student lab")
+    args = parser.parse_args(argv)
+
+    layout = discover_layout()
+
+    if args.install:
+        install(layout)
+        return 0
+
+    run_loop(layout)
+    return 0
 
 
 if __name__ == "__main__":
-    if "--install" in sys.argv:
-        print("\n🚀 MOCKLAB UNIVERSAL INSTALL\n")
-
-        in_container = os.path.exists("/var/www/localhost/htdocs/openemr/sites/default/sqlconf.php")
-
-        print("  1. Creating EDI directories...")
-        ensure_edi_paths()
-
-        print("  2. Configuring OpenEMR database...")
-        auto_configure()
-
-        print("  3. Seeding diagnosis codes...")
-        seed_diagnosis_codes()
-
-        print("  4. Seeding patient problem history...")
-        seed_problem_history()
-
-        print("  5. Patching validation logic...")
-        patch_php()
-
-        print("\n🎉 Turnkey install complete.")
-        print(f"Mocklab is now configured for OpenEMR in {CONFIG['CONTAINER_NAME']}")
-        print("The simulator container starts automatically with Docker Compose.")
-        sys.exit(0)
-
-    print(f"\n🧪 Starting Ontario Lab Simulator on port {CONFIG['PORT']}...")
-    print(f"   Container: {CONFIG['CONTAINER_NAME']}")
-    print(f"   Monitoring: {CONFIG['EDI_BASE']}/orders")
-    print(f"   Writing results to: {CONFIG['EDI_BASE']}/inbox\n")
-    threading.Thread(target=watcher, daemon=True).start()
-    app.run(host="0.0.0.0", port=CONFIG["PORT"])
+    if pymysql is None:
+        print("PyMySQL is required. Install it with: pip install pymysql")
+        raise SystemExit(1)
+    raise SystemExit(main())
