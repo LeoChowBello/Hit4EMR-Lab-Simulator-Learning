@@ -28,10 +28,16 @@ The goal is simple:
 1. Log into OpenEMR.
 2. Open the patient chart.
 3. Go to `Encounter -> Orders -> Procedure Orders`.
-4. Create a new lab order.
-5. Choose one of the sample tests.
-6. Wait a few seconds.
-7. Check `Procedures -> Pending Review -> Procedure Results`.
+4. Open the new procedure order form.
+5. In `Default Procedure Type`, choose `Laboratory Test`.
+6. Fill the required order fields on the form:
+   - `Primary Diagnosis`
+   - `Specimen Collection Date`, if the field appears
+   - `Billing Type`, if the field appears
+7. Choose one of the sample tests.
+8. Save the order.
+9. Wait a few seconds.
+10. Check `Procedures -> Pending Review -> Procedure Results`.
 
 ## Sample lab tests
 
