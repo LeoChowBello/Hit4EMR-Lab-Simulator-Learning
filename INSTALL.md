@@ -4,6 +4,7 @@
 
 - detects whether you are using a host install or a Docker sandbox
 - prepares the lab data inside OpenEMR
+- starts the background simulator so results arrive automatically
 - gives the student a guided first-login walkthrough
 - keeps the workflow inside OpenEMR first
 
@@ -24,6 +25,7 @@ If you are using Docker, place the compose stack beside this repo before running
 - a short preflight check
 - a visible progress indicator while the lab starts
 - a setup confirmation after the lab data is inserted
+- a background simulator log called `hit4emr-simulator.log`
 - a short walkthrough of where to click in OpenEMR
 
 ## Login
@@ -71,6 +73,7 @@ Use this in the chart:
 - it uses OpenEMR's normal workflow first
 - it simulates an external lab instead of hiding the lab process
 - it teaches interoperability in a way students can follow
+- it starts the simulator automatically so students do not need a second command
 - it is less confusing for first-time users
 
 ## If something goes wrong
