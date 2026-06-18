@@ -20,10 +20,17 @@ If you are installing on a server where OpenEMR already exists, the script will 
 
 If you are using Docker, place the compose stack beside this repo before running the installer.
 
+At the start, the installer shows a simple choice screen:
+
+- AWS EC2 Ubuntu host install
+- local Ubuntu host install like ElCurioso
+- Docker sandbox on the same machine, if the compose stack is present
+
 ## What students should expect
 
 - a short preflight check
 - a visible progress indicator while the lab starts
+- a self-check for the one Python package it needs
 - a setup confirmation after the lab data is inserted
 - a background simulator log called `hit4emr-simulator.log`
 - a short walkthrough of where to click in OpenEMR
