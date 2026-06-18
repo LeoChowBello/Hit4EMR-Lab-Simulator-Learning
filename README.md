@@ -65,12 +65,19 @@ bash install.sh
 
 If you are using Docker, place the compose stack beside this repo and then run the same installer.
 
+When the installer starts, it will ask you to choose the setup that matches your machine:
+
+- AWS EC2 Ubuntu host install
+- local Ubuntu host install like ElCurioso
+- Docker sandbox on the same machine, if a compose stack is present
+
 ## What the installer does
 
 - prepares the EDI folders
 - seeds the sample lab tests
 - seeds the sample diagnosis codes
 - relaxes a few training-only order checks
+- auto-fixes the one Python package it needs if possible
 - starts the background simulator so results flow back automatically
 - shows a guided first-login walkthrough
 
