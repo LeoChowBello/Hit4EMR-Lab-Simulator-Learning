@@ -71,6 +71,7 @@ If you are using Docker, place the compose stack beside this repo and then run t
 - seeds the sample lab tests
 - seeds the sample diagnosis codes
 - relaxes a few training-only order checks
+- starts the background simulator so results flow back automatically
 - shows a guided first-login walkthrough
 
 ## Notes
