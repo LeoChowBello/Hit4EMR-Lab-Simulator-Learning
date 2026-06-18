@@ -61,6 +61,17 @@ echo "  2. Sample lab tests will be added"
 echo "  3. The order form will be softened for teaching use"
 echo "  4. You will get a short first-login walkthrough"
 
+if ! python3 - <<'PY' >/dev/null 2>&1
+import pymysql
+PY
+then
+    echo
+    echo "ERROR: Python module 'pymysql' is missing."
+    echo "Install it once as the server admin, then rerun the installer."
+    echo "For example: python3 -m pip install --user pymysql"
+    exit 1
+fi
+
 pause_for_student "Press Enter when you are ready to continue."
 
 if [ "$MODE" = "host" ]; then
@@ -68,6 +79,17 @@ if [ "$MODE" = "host" ]; then
     echo "Step 2 of 4: Preparing your existing OpenEMR install"
     echo
     python3 ontario_lab_turnkey.py --install
+
+    SIM_LOG="./hit4emr-simulator.log"
+    if pgrep -f "ontario_lab_turnkey.py" >/dev/null 2>&1; then
+        echo
+        echo "Simulator is already running."
+    else
+        echo
+        echo "Starting the background simulator..."
+        nohup python3 ontario_lab_turnkey.py >"$SIM_LOG" 2>&1 &
+        echo "  Log file: $SIM_LOG"
+    fi
 else
     if [ ! -f "$COMPOSE_FILE" ]; then
         echo
@@ -159,6 +181,17 @@ else
     echo "Step 4 of 4: Configuring the student lab"
     echo
     python3 ontario_lab_turnkey.py --install
+
+    SIM_LOG="./hit4emr-simulator.log"
+    if pgrep -f "ontario_lab_turnkey.py" >/dev/null 2>&1; then
+        echo
+        echo "Simulator is already running."
+    else
+        echo
+        echo "Starting the background simulator..."
+        nohup python3 ontario_lab_turnkey.py >"$SIM_LOG" 2>&1 &
+        echo "  Log file: $SIM_LOG"
+    fi
 fi
 
 echo
@@ -197,5 +230,8 @@ echo "  3. Create a new order"
 echo "  4. Pick a sample test"
 echo "  5. Wait a few seconds"
 echo "  6. Check Procedures -> Pending Review -> Procedure Results"
+echo
+echo "Simulator log:"
+echo "  hit4emr-simulator.log"
 echo
 echo "For more help, see: INSTALL.md"
