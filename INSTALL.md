@@ -12,7 +12,7 @@
 From the repository folder:
 
 ```bash
-./install.sh
+bash install.sh
 ```
 
 If you are installing on a server where OpenEMR already exists, the script will use host mode and connect to that installation.
